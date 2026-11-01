@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dinocarve</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f7f7f5; --fg: #1d1d1b; --muted: #6b6b66; --cell: #e6e5e0; --accent: #2f6fdf;
+    font: 15px/1.5 system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161615; --fg: #ecebe6; --muted: #9a9993; --cell: #262624; --accent: #7aa7ff; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); }
+  main { max-width: 960px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  h2 { font-size: 1.1rem; margin: 40px 0 4px; }
+  p { margin: 0 0 16px; color: var(--muted); }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .pair figure { margin: 0; }
+  .pair carved-image { height: min(50vh, 400px); }
+  figcaption { font-size: 13px; color: var(--muted); margin-top: 4px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; margin-top: 12px; }
+  .controls input { flex: 1 1 200px; accent-color: var(--accent); }
+  output { font: 13px/1.4 ui-monospace, monospace; color: var(--muted); }
+  carved-gallery carved-image { background: var(--cell); }
+  .tall { grid-row: span 2; }
+  .wide { grid-column: span 2; }
+  .big { grid-column: span 2; grid-row: span 2; }
+</style>
+</head>
+<body>
+<main>
+  <h1>dinocarve</h1>
+  <p>Seam carving compiled offline. The browser only compacts each row by a precomputed rank.</p>
+
+  <div class="pair">
+    <figure><carved-image id="textbook" src="../examples/gnome-textbook/" width-percent="100"></carved-image><figcaption>Textbook forward energy</figcaption></figure>
+    <figure><carved-image id="hero" src="../examples/gnome/" width-percent="100"></carved-image><figcaption>dinocarve (DINOv2 saliency + part budget)</figcaption></figure>
+  </div>
+  <div class="controls">
+    <input id="pct" type="range" min="40" max="100" value="100" aria-label="Width percent">
+    <output id="readout">loading</output>
+  </div>
+
+  <h2>Gallery</h2>
+  <p>Each cell carves to its own aspect. Resize the window and the cells recarve.</p>
+  <carved-gallery>
+    <carved-image class="tall" src="../examples/gnome/"></carved-image>
+    <carved-image src="../examples/gnome/"></carved-image>
+    <carved-image class="big" src="../examples/gnome/"></carved-image>
+    <carved-image class="tall" src="../examples/gnome/"></carved-image>
+    <carved-image class="wide" src="../examples/gnome/"></carved-image>
+    <carved-image src="../examples/gnome/" style="grid-row: span 3"></carved-image>
+  </carved-gallery>
+</main>
+<script type="module">
+  import './dinocarve.js';
+  const hero = document.getElementById('hero'), textbook = document.getElementById('textbook');
+  const pct = document.getElementById('pct'), readout = document.getElementById('readout');
+  pct.addEventListener('input', () => { for (const el of [hero, textbook]) el.setAttribute('width-percent', pct.value); });
+  hero.addEventListener('carved', ({detail: {k, width, ms, backend}}) => {
+    pct.min = Math.ceil(100 * (hero.naturalWidth - hero.maxRemove) / hero.naturalWidth);
+    readout.textContent = `k=${k}  width=${width}px  ${ms.toFixed(2)}ms  ${backend}`;
+  });
+</script>
+</body>
+</html>

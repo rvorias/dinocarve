@@ -1,0 +1,20 @@
+{
+ "version": 1,
+ "width": 1024,
+ "height": 1024,
+ "max_remove": 614,
+ "never": 65535,
+ "image": "image.jpg",
+ "rank": "rank.png",
+ "encoding": "rank = R*256 + G. Pixel (x,y) is kept after removing k seams iff rank >= k.",
+ "method": "dino",
+ "params": {
+  "forward": "relative",
+  "stress": 0.5,
+  "keep_weight": 10.0,
+  "budget": 2.0,
+  "parts": 12
+ },
+ "seconds": 4.72,
+ "device": "cuda:1"
+}

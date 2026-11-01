@@ -1,0 +1,16 @@
+[project]
+name = "dinocarve"
+version = "0.1.0"
+description = "Seam carving guided by DINOv2 saliency, compiled once and resized in the browser"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.2", "numpy", "pillow", "einops"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["dinocarve*"]
