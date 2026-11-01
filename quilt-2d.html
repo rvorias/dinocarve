@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Seamframe · Living quilt</title>
+<style>
+  :root { --bg:#0a0d0c; --ink:#e7eee9; --muted:#9fb3a7; --accent:#c7df92; --panel:rgba(14,19,17,.78); }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--ink); font:13px/1.45 system-ui,sans-serif; overflow:hidden; }
+  canvas { position:fixed; inset:0; width:100vw; height:100vh; display:block; }
+  .hud { position:fixed; left:18px; bottom:18px; display:flex; flex-wrap:wrap; gap:10px 16px; align-items:center; padding:10px 14px; background:var(--panel); border:1px solid rgba(199,223,146,.14); border-radius:12px; backdrop-filter:blur(10px); max-width:calc(100vw - 36px); transition:opacity .4s; }
+  .hud b { font:normal 17px Georgia,serif; margin-right:2px; letter-spacing:.01em; }
+  .hud button { background:rgba(255,255,255,.04); color:var(--ink); border:1px solid rgba(255,255,255,.1); border-radius:7px; padding:4px 10px; font:inherit; cursor:pointer; }
+  .hud button[aria-pressed=true] { border-color:var(--accent); color:var(--accent); }
+  .hud label { display:flex; align-items:center; gap:6px; color:var(--muted); }
+  .hud input[type=range] { width:110px; accent-color:var(--accent); }
+  .hud a { color:var(--accent); }
+  #stats { color:var(--muted); font-variant-numeric:tabular-nums; min-width:220px; }
+  .hud.hidden { opacity:0; pointer-events:none; }
+  @media (max-width:600px){ #stats{min-width:0} .hud{left:10px;right:10px;bottom:10px} }
+</style>
+</head>
+<body>
+<canvas id="quilt" aria-label="A quilt of images that continuously resize by compiled seam carving"></canvas>
+<div class="hud" id="hud" hidden>
+  <b>Living quilt</b>
+  <button id="pause" aria-pressed="false" title="Space">Pause</button>
+  <button id="mode" aria-pressed="false" title="S: compare with plain resizing">Squash instead</button>
+  <button id="gaps" aria-pressed="true" title="G">Gaps</button>
+  <label>Motion <input type="range" id="motion" min="0" max="100" value="0"></label>
+  <span id="stats">loading…</span>
+  <a href="carve-images.html">how it works</a>
+</div>
+<script type="module">
+  const BASE = new URL(({cc0: 'data/cc0/', kup: 'data/kup/'})[new URLSearchParams(location.search).get('c')] || 'data/cc0/', location.href).href, $ = id => document.getElementById(id), canvas = $('quilt'), ctx = canvas.getContext('2d');
+  const CACHE = 28, INFLIGHT = 3;
+
+  // ---- workers: each owns a subset of tiles, renders carved states on request ----
+  const nWorkers = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 4) - 1));
+  const workers = Array.from({length: nWorkers}, () => ({w: new Worker('quilt-worker.js?v=7'), inflight: 0, wanted: new Map(), ready: false}));
+  let tiles = [], byName = new Map(), q = null;
+  function want(t, j, ky, prio) {
+    const key = j + ':' + ky; if (t.cache.has(key) || t.pending.has(key) || !t.ready) return;
+    const m = t.worker.wanted, id = t.name + '|' + key, p = m.get(id);
+    if (p === undefined || prio < p.prio) m.set(id, {t, j, ky, key, prio});
+  }
+  function pump() {
+    for (const W of workers) {
+      const list = [...W.wanted.values()].sort((a, b) => a.prio - b.prio); W.wanted.clear();
+      for (const r of list) { if (W.inflight >= INFLIGHT) break; r.t.pending.add(r.key); W.inflight++; W.w.postMessage({type: 'render', name: r.t.name, j: r.j, ky: r.ky}); }
+    }
+  }
+  workers.forEach(W => W.w.onmessage = ({data}) => {
+    if (data.type === 'loaded') { const t = byName.get(data.name); if (t) t.ready = true; else console.warn('quilt: stale worker message', data); return; }
+    if (data.type === 'error') { console.error('quilt worker:', data.message); W.inflight = Math.max(0, W.inflight - 1); return; }
+    W.inflight--; const t = byName.get(data.name), key = data.j + ':' + data.ky; if (!t) return; t.pending.delete(key);
+    t.cache.set(key, {bitmap: data.bitmap, used: performance.now(), j: data.j, ky: data.ky});
+    if (t.cache.size > CACHE) { let old = null; for (const [k, v] of t.cache) if (!old || v.used < old[1].used) old = [k, v]; old[1].bitmap.close(); t.cache.delete(old[0]); }
+  });
+
+  // ---- smooth layout: sizes = min + (max - min) * sigmoid(u + pressure), pressure solved so the sum fits ----
+  const sig = x => 1 / (1 + Math.exp(-x));
+  function fit(us, mins, maxs, total) {
+    let lo = -30, hi = 30;
+    for (let it = 0; it < 40; it++) { const m = (lo + hi) / 2, s = us.reduce((a, u, i) => a + mins[i] + (maxs[i] - mins[i]) * sig(u + m), 0); if (s > total) hi = m; else lo = m; }
+    const m = (lo + hi) / 2; return us.map((u, i) => mins[i] + (maxs[i] - mins[i]) * sig(u + m));
+  }
+  const noise = (t, a) => .6 * Math.sin(t * a.f1 + a.p1) + .4 * Math.sin(t * a.f2 + a.p2);
+  const wave = () => ({f1: .18 + Math.random() * .22, f2: .41 + Math.random() * .35, p1: Math.random() * 6.3, p2: Math.random() * 6.3});
+
+  let start = 0, rows = [], hover = null, paused = false, squash = false, gaps = true, last = performance.now(), clock = 0, fps = 60, born = performance.now();
+  function layout() {
+    const dpr = Math.min(devicePixelRatio || 1, 2), W = innerWidth, H = innerHeight;
+    canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr); ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const nRows = Math.max(2, Math.round(H / Math.min(340, Math.max(180, H / 3)))), rowH = H / nRows;
+    rows = []; let cursor = start;
+    for (let r = 0; r < nRows; r++) {
+      const s = rowH / q.height / .8, slots = []; let nat = 0, min = 0;
+      while (nat < W * 1.5 || slots.length < 2) {
+        const t = tiles[(q.orders?.edges || q.order)[cursor++ % q.order.length]], wmin = t.widths.at(-1) * s;
+        if (min + wmin > W * .9 && slots.length >= 2) { cursor--; break; }
+        slots.push({t, wave: wave(), spring: 0, vel: 0}); nat += t.width * s; min += wmin;
+      }
+      rows.push({s, slots, wave: wave(), spring: 0, vel: 0});
+    }
+  }
+  function spring(o, goal, dt) { const k = 60, c = 2 * Math.sqrt(k); o.vel += (k * (goal - o.spring) - c * o.vel) * dt; o.spring += o.vel * dt; }
+
+  function blendAlphas(ws) { const a = new Array(ws.length); let tail = 0; for (let i = ws.length - 1; i >= 0; i--) { a[i] = i === 0 ? 1 : ws[i] / (1 - tail); tail += ws[i]; } return a; }
+
+  function frame(now) {
+    const dt = Math.min(.05, (now - last) / 1000); last = now; fps += ((1 / Math.max(dt, 1e-3)) - fps) * .05;
+    if (!paused) clock += dt * (+$('motion').value / 50);
+    const W = innerWidth, H = innerHeight, gap = gaps ? 6 : 0, radius = gaps ? 10 : 0, amp = 1.1;
+    rows.forEach((r, i) => spring(r, hover && hover.row === i ? 1 : 0, dt));
+    const hu = rows.map(r => amp * .8 * noise(clock, r.wave) + 2.2 * r.spring);
+    const hmin = rows.map(r => (q.height - Math.min(...r.slots.map(s => s.t.max_remove_y))) * r.s), hmax = rows.map(r => q.height * r.s);
+    const heights = fit(hu, hmin, hmax, H - gap * (rows.length + 1));
+    ctx.fillStyle = '#0a0d0c'; ctx.fillRect(0, 0, W, H);
+    const fade = Math.min(1, (now - born) / 900);
+    let y = gap;
+    rows.forEach((row, r) => {
+      row.slots.forEach((s, i) => spring(s, hover && hover.row === r && hover.slot === i ? 1 : 0, dt));
+      const us = row.slots.map(s => amp * noise(clock, s.wave) + 2.6 * s.spring);
+      const widths = fit(us, row.slots.map(s => s.t.widths.at(-1) * row.s), row.slots.map(s => s.t.width * row.s), W - gap * (row.slots.length + 1));
+      let x = gap; row.rect = [];
+      row.slots.forEach((s, i) => {
+        const w = widths[i], h = heights[r];
+        ctx.save(); ctx.beginPath(); ctx.roundRect(x, y, w, h, radius); ctx.clip();
+        ctx.globalAlpha = fade; drawTileBlend(s.t, x, y, w, h, row.s); ctx.restore();
+        row.rect.push([x, y, w, h]); x += w + gap;
+      });
+      y += heights[r] + gap;
+    });
+    pump();
+    const cached = tiles.reduce((a, t) => a + t.cache.size, 0), busy = workers.reduce((a, w) => a + w.inflight, 0);
+    $('stats').textContent = `${tiles.length} images · ${fps.toFixed(0)} fps · ${cached} states cached · ${busy} carving`;
+    requestAnimationFrame(frame);
+  }
+  // Exact 4-way blend: weights w_i, drawn in order with alphas from blendAlphas.
+  function drawTileBlend(t, x, y, w, h, s) {
+    const H = t.height, ws = Math.max(t.widths.at(-1), Math.min(t.width, w / s)), ky = Math.max(0, Math.min(t.max_remove_y, H - h / s));
+    let j = 0; while (j + 1 < t.widths.length && t.widths[j + 1] >= ws) j++;
+    const p = j + 1 < t.widths.length ? (t.widths[j] - ws) / (t.widths[j] - t.widths[j + 1]) : 0;
+    let k0 = Math.floor(ky), fy = ky - k0; if (k0 >= t.max_remove_y) { k0 = t.max_remove_y; fy = 0; }
+    const j1 = Math.min(j + 1, t.widths.length - 1), k1 = Math.min(k0 + 1, t.max_remove_y), clampK = k => Math.max(0, Math.min(t.max_remove_y, k));
+    const states = [[j, k0, (1 - p) * (1 - fy)], [j, k1, (1 - p) * fy], [j1, k0, p * (1 - fy)], [j1, k1, p * fy]].filter(s => s[2] > .004);
+    for (const [sj, sk] of states) want(t, sj, sk, 0);
+    for (let d = -3; d <= 4; d++) { want(t, j, clampK(k0 + d), 1); want(t, j1, clampK(k0 + d), 1); }
+    if (j > 0) want(t, j - 1, k0, 2); if (j1 + 1 < t.widths.length) want(t, j1 + 1, k0, 2);
+    const base = ctx.globalAlpha;
+    if (squash) { ctx.drawImage(t.image, x, y, w, h); return; }
+    const now = performance.now(), got = states.map(([sj, sk, wt]) => {
+      let c = t.cache.get(sj + ':' + sk);
+      if (!c) { let best = 1e9; for (const v of t.cache.values()) { const d = Math.abs(v.j - sj) * 8 + Math.abs(v.ky - sk); if (d < best) { best = d; c = v; } } }
+      if (c) c.used = now; return [c, wt];
+    });
+    if (got.some(g => !g[0])) { ctx.drawImage(t.image, x, y, w, h); return; }
+    const total = got.reduce((a, g) => a + g[1], 0), alphas = blendAlphas(got.map(g => g[1] / total));
+    got.forEach(([c], i) => { ctx.globalAlpha = base * alphas[i]; ctx.drawImage(c.bitmap, x, y, w, h); });
+    ctx.globalAlpha = base;
+  }
+
+  canvas.addEventListener('pointermove', e => {
+    hover = null;
+    rows.forEach((row, r) => row.rect?.forEach(([x, y, w, h], i) => { if (e.clientX >= x && e.clientX < x + w && e.clientY >= y && e.clientY < y + h) hover = {row: r, slot: i}; }));
+  });
+  canvas.addEventListener('pointerleave', () => hover = null);
+  const toggle = (id, fn) => { const b = $(id); b.addEventListener('click', () => { const on = b.getAttribute('aria-pressed') !== 'true'; b.setAttribute('aria-pressed', on); fn(on); }); };
+  toggle('pause', on => paused = on); toggle('mode', on => squash = on); toggle('gaps', on => gaps = on);
+  addEventListener('keydown', e => { const k = {' ': 'pause', s: 'mode', g: 'gaps'}[e.key.toLowerCase()]; if (k) { e.preventDefault(); $(k).click(); } if (e.key.toLowerCase() === 'h') $('hud').classList.toggle('hidden'); });
+  addEventListener('resize', () => layout());
+  (async () => {
+    q = await fetch(BASE + 'quilt.json').then(r => { if (!r.ok) throw Error('Run lab/quilt.py first'); return r.json(); });
+    tiles = await Promise.all(q.tiles.map(async (m, i) => {
+      const r = await fetch(`${BASE}${m.name}/image.webp`), image = await createImageBitmap(await r.blob());
+      return {...m, image, cache: new Map(), pending: new Set(), ready: false};
+    }));
+    tiles.forEach(t => byName.set(t.name, t));
+    start = Math.floor(Math.random() * q.order.length); layout();
+    // Visible tiles first (in layout order), then the rest; spread round-robin over the workers.
+    const seen = new Set(), prio = [];
+    for (const r of rows) for (const s of r.slots) if (!seen.has(s.t.name)) { seen.add(s.t.name); prio.push(s.t); }
+    for (const t of tiles) if (!seen.has(t.name)) prio.push(t);
+    prio.forEach((t, i) => t.worker = workers[i % nWorkers]);
+    workers.forEach(W => W.w.postMessage({type: 'load', base: BASE, tiles: prio.filter(t => t.worker === W).map(t => q.tiles.find(m => m.name === t.name))}));
+    requestAnimationFrame(frame);
+  })().catch(e => $('stats').textContent = e.message);
+</script>
+</body>
+</html>

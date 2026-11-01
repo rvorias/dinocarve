@@ -1,0 +1,486 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Living Quilt</title>
+<style>
+  :root { --bg:#0a0d0c; --ink:#e7eee9; --muted:#9fb3a7; --accent:#c7df92; --panel:rgba(14,19,17,.78); }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--ink); font:13px/1.45 system-ui,sans-serif; overflow:hidden; }
+  canvas { position:fixed; inset:0; width:100vw; height:100vh; display:block; }
+  .hud { position:fixed; left:18px; bottom:18px; display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; padding:10px 14px; background:var(--panel); border:1px solid rgba(199,223,146,.14); border-radius:12px; backdrop-filter:blur(10px); max-width:calc(100vw - 36px); transition:opacity .4s; }
+  .hud b { font:normal 17px Georgia,serif; margin-right:2px; }
+  .hud button { background:rgba(255,255,255,.04); color:var(--ink); border:1px solid rgba(255,255,255,.1); border-radius:7px; padding:4px 9px; font:inherit; cursor:pointer; }
+  .hud button[aria-pressed=true] { border-color:var(--accent); color:var(--accent); }
+  .hud .modes { display:flex; flex-wrap:wrap; gap:4px; }
+  .hud kbd { font:11px ui-monospace,monospace; opacity:.6; margin-right:4px; }
+  .hud label { display:flex; align-items:center; gap:6px; color:var(--muted); }
+  .hud input[type=range] { width:100px; accent-color:var(--accent); }
+  .hud a { color:var(--accent); }
+  #stats { color:var(--muted); font-variant-numeric:tabular-nums; min-width:230px; }
+  .hud.hidden { opacity:0; pointer-events:none; }
+  .hud[hidden] { display:none; }
+  .hud select { background:rgba(255,255,255,.04); color:var(--ink); border:1px solid rgba(255,255,255,.1); border-radius:7px; padding:3px 6px; font:inherit; }
+  #caption { position:fixed; right:18px; top:18px; max-width:min(420px, 40vw); padding:8px 12px; background:var(--panel); border:1px solid rgba(199,223,146,.14); border-radius:10px; backdrop-filter:blur(10px); font-size:12px; color:var(--muted); opacity:0; transition:opacity .25s; pointer-events:none; }
+  #caption b { display:block; color:var(--ink); font:normal 15px Georgia,serif; margin-bottom:2px; }
+  #caption.show { opacity:1; }
+</style>
+</head>
+<body>
+<canvas id="quilt" aria-label="A quilt of images that continuously resize by compiled seam carving"></canvas>
+<div id="caption" aria-live="polite"></div>
+<div class="hud" id="hud">
+  <b>Living quilt</b>
+  <span class="modes" id="modes"></span>
+  <button id="pause" aria-pressed="false" title="Space">Pause</button>
+  <button id="energy" aria-pressed="false" title="V: vanilla seam carving (textbook forward energy) vs ours">Vanilla</button>
+  <button id="mode" aria-pressed="false" title="S: compare with plain resizing">Squash</button>
+  <button id="gaps" aria-pressed="true" title="G">Gaps</button>
+  <button id="order" aria-pressed="false" title="O: order tiles by StyleCore style similarity or by edge continuity">Order: style</button>
+  <label>Motion <input type="range" id="motion" min="0" max="100" value="50"></label>
+  <label>Collection <select id="collection"></select></label>
+  <span id="stats">loading…</span>
+  <a href="carve-images.html">how it works</a>
+</div>
+<script>window.QUILT_EMBED = {"collections": {"cc0": ["CC0 masterpieces", "data/cc0/"], "kup": ["Kup", "data/kup/"]}, "collection": "cc0", "mode": 0, "motion": 0, "order": "edges", "background": "0a0d0c"};</script>
+<script type="module">
+/* Living quilt, WebGL2 renderer.
+
+   Per tile and width level j the GPU holds the level image (RGBA8) and a seam table
+   Y[r][x] = row removed by horizontal seam r in column x (R16UI). Each visible tile keeps a
+   position field P_k(x, y) = y - #{r < k : Y[r][x] < y}: the output row of source pixel y once
+   k seams are gone. P is non-decreasing down a column, so
+     - k -> k±Δ is an O(Δ) update per texel (usually Δ = 0..3 per frame),
+     - the source pixel under any output row is a binary search (~10 fetches),
+     - fractional k = k0 + f is exact: seam pixel k0 gets height 1 - f, rows below shift by -f.
+   A carve pass writes the carved tile at display resolution; the draw pass blends two width
+   levels near level boundaries and masks rounded corners. Work is proportional to motion, and
+   only full rebuilds are rate-limited; slow GPUs lower resolution instead of deferring updates.
+   Channels follow their level, so crossing a width level never forces a rebuild. */
+const $ = id => document.getElementById(id), canvas = $('quilt');
+// Embedding (tools/export_quilt.py): window.QUILT_EMBED = {collections, collection, mode, motion, order, background}
+// fixes the settings and hides the controls. ?c=<collection> and ?bg=<hex> still work in an embed.
+const EMBED = window.QUILT_EMBED || null;
+const COLLECTIONS = EMBED?.collections || {cc0: ['CC0 masterpieces', '../dist/quilt-cc0/'], images: ['My images', '../dist/quilt/'], glif: ['Glif', '../dist/quilt-glif/'], kup: ['Kup', '../dist/quilt-kup/']};
+const params = new URLSearchParams(location.search), collection = COLLECTIONS[params.get('c')] ? params.get('c') : EMBED?.collection || Object.keys(COLLECTIONS)[0];
+const BG = (h => h && /^[0-9a-f]{6}$/i.test(h) ? [0, 2, 4].map(i => parseInt(h.slice(i, i + 2), 16) / 255) : [.039, .051, .047])((params.get('bg') || EMBED?.background || '').replace('#', ''));
+document.documentElement.style.setProperty('--bg', `rgb(${BG.map(v => Math.round(v * 255))})`);
+const BASE = new URL(COLLECTIONS[collection][1], location.href).href;
+const MODES = [['Breathe', 'ambient waves, hover to swell'], ['Press', 'the cursor pushes into the quilt'], ['Fisheye', 'magnify around the cursor'], ['Plow', 'sweep to carve a wake'], ['Ripple', 'click to send carving waves']];
+const fallback = why => { console.warn('quilt: falling back to the 2D renderer:', why); location.replace('quilt-2d.html' + location.search); };
+const gl = canvas.getContext('webgl2', {alpha: false, antialias: false, depth: false, stencil: false, premultipliedAlpha: false, powerPreference: 'high-performance'});
+if (!gl) { fallback('WebGL2 unavailable'); throw Error('no WebGL2'); }
+canvas.addEventListener('webglcontextlost', e => { e.preventDefault(); fallback('WebGL context lost'); });
+
+// ---------- shaders ----------
+const VS = `#version 300 es
+uniform vec4 uRect; uniform vec2 uRes; out vec2 vUv;
+void main() {
+  vec2 q = vec2(gl_VertexID == 1 || gl_VertexID == 4 || gl_VertexID == 5 ? 1. : 0., gl_VertexID == 2 || gl_VertexID == 3 || gl_VertexID == 5 ? 1. : 0.);
+  vUv = q; vec2 px = uRect.xy + q * uRect.zw;                     // uRect in target pixels, origin top-left
+  gl_Position = vec4(px.x / uRes.x * 2. - 1., 1. - px.y / uRes.y * 2., 0., 1.);
+}`;
+const POS = `#version 300 es
+precision highp float; precision highp int; precision highp usampler2D;
+uniform usampler2D uPos, uSeam; uniform int uFrom, uTo, uSign, uRebuild; out uvec4 o;
+void main() {
+  ivec2 c = ivec2(gl_FragCoord.xy); int x = c.x, y = c.y;
+  int p = uRebuild == 1 ? y : int(texelFetch(uPos, c, 0).r), n = 0;
+  for (int r = uFrom; r < uTo; r++) n += int(texelFetch(uSeam, ivec2(x, r), 0).r) < y ? 1 : 0;
+  o = uvec4(uint(p - uSign * n), 0u, 0u, 0u);
+}`;
+const CARVE = `#version 300 es
+precision highp float; precision highp int; precision highp usampler2D;
+uniform usampler2D uPos, uSeam, uMarks; uniform sampler2D uColor;
+uniform int uH, uK0, uKy, uTaps, uWj, uN; uniform float uF, uScale, uXScale, uKx; out vec4 o;
+float peff(int x, int y, int s0) { return float(texelFetch(uPos, ivec2(x, y), 0).r) - (y > s0 ? uF : 0.); }
+int s0At(int x) { return (uK0 < uKy && uF > 0.) ? int(texelFetch(uSeam, ivec2(x, uK0), 0).r) : 1 << 20; }
+int locate(int x, float q) {                                       // height: last row whose (effective) position <= q
+  int s0 = s0At(x), lo = 0, hi = uH - 1;
+  for (int it = 0; it < 12; it++) { if (lo >= hi) break; int mid = (lo + hi + 1) >> 1; if (peff(x, mid, s0) <= q) lo = mid; else hi = mid - 1; }
+  return lo;
+}
+int column(int y, float u) {                                       // width: invert row y, whose width seams have widths 1 - clamp(kx - r, 0, 1)
+  float D = 0.;
+  for (int i = 0; i < 64; i++) { if (i >= uN) break;
+    uvec2 m = texelFetch(uMarks, ivec2(i, y), 0).rg; float d = clamp(uKx - float(m.g), 0., 1.), pm = float(m.r) - D;
+    if (pm > u) break;
+    if (u < pm + 1. - d) return int(m.r);
+    D += d; }
+  return clamp(int(floor(u + D)), 0, uWj - 1);
+}
+void main() {                                                     // output texel = display-resolution column x row
+  ivec2 c = ivec2(gl_FragCoord.xy); float v = float(c.y), wcont = float(uWj) - uKx;
+  int nx = uXScale > 1.5 ? 2 : 1, n = clamp(int(ceil(uScale)), 1, uTaps); vec3 acc = vec3(0.);
+  for (int a = 0; a < 2; a++) { if (a >= nx) break;
+    float u = (float(c.x) + (float(a) + .5) / float(nx)) * uXScale;          // continuous position in the carved row
+    int xg = clamp(int(u * float(uWj) / wcont), 0, uWj - 1);
+    for (int i = 0; i < 4; i++) { if (i >= n) break;
+      float qv = (v + (float(i) + .5) / float(n)) * uScale;
+      // The source column depends on the row and vice versa: one fixed-point step resolves both.
+      int y0 = locate(xg, qv), x1 = column(y0, u), y1 = locate(x1, qv);
+      vec3 col = texelFetch(uColor, ivec2(x1, y1), 0).rgb; acc += col * col; } }   // ~linear light (gamma 2)
+  o = vec4(sqrt(acc / float(n * nx)), 1.);
+}`;
+const DRAW = `#version 300 es
+precision highp float; uniform sampler2D uA, uB; uniform vec4 uUa, uUb, uRect; uniform float uBlend, uAlpha, uRadius; in vec2 vUv; out vec4 o;
+void main() {
+  vec3 a = texture(uA, vUv * uUa.xy + uUa.zw).rgb;
+  if (uBlend > 0.) a = mix(a, texture(uB, vUv * uUb.xy + uUb.zw).rgb, uBlend);   // second level only near level boundaries
+  vec2 p = (vUv - .5) * uRect.zw, q = abs(p) - (uRect.zw * .5 - vec2(uRadius));
+  float d = length(max(q, 0.)) + min(max(q.x, q.y), 0.) - uRadius;
+  o = vec4(a, clamp(.5 - d, 0., 1.) * uAlpha);
+}`;
+const SPIN = `#version 300 es
+precision highp float; uniform vec4 uRect; uniform float uTime, uAlpha; in vec2 vUv; out vec4 o;
+void main() {                                                     // loading spinner: soft backdrop disc + rotating tapered arc
+  vec2 p = (vUv - .5) * uRect.zw; float R = uRect.z * .5, r = length(p), px = 1.;
+  float disc = clamp(R - r + .5, 0., 1.) * .5;
+  float ring = clamp(R * .09 - abs(r - R * .6) + .5, 0., 1.);
+  float a = fract(atan(p.y, p.x) / 6.2831853 + uTime * 1.2), arc = ring * smoothstep(.15, 1., a);
+  float alpha = mix(disc, 1., arc);
+  o = vec4(vec3(.78, .87, .57) * arc / max(alpha, 1e-3), alpha * uAlpha);
+}`;
+function program(fs) {
+  const p = gl.createProgram();
+  for (const [type, src] of [[gl.VERTEX_SHADER, VS], [gl.FRAGMENT_SHADER, fs]]) {
+    const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw Error(gl.getShaderInfoLog(s)); gl.attachShader(p, s);
+  }
+  gl.linkProgram(p); if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw Error(gl.getProgramInfoLog(p));
+  const u = {}; const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const name = gl.getActiveUniform(p, i).name; u[name] = gl.getUniformLocation(p, name); }
+  return {p, u};
+}
+let P;
+try { P = {pos: program(POS), carve: program(CARVE), draw: program(DRAW), spin: program(SPIN)}; } catch (e) { fallback('shader: ' + e.message); throw e; }
+gl.bindVertexArray(gl.createVertexArray());
+gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+function texture(w, h, internal, fmt, type, data, linear) {
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, fmt, type, data || null);
+  const f = linear ? gl.LINEAR : gl.NEAREST;
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, f); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, f);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+function target(w, h, internal, fmt, type, linear) {
+  const tex = texture(w, h, internal, fmt, type, null, linear), fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw Error('framebuffer incomplete');
+  return {tex, fb};
+}
+function imageTexture(t) {                                       // plain image, for tiles whose seams are not ready yet (squash)
+  if (t.img || t.imgLoading) return t.img; t.imgLoading = true;
+  fetch(BASE + t.name + '/image.webp').then(r => r.blob()).then(b => createImageBitmap(b)).then(bm => {
+    const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, bm); gl.generateMipmap(gl.TEXTURE_2D); bm.close();
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    t.img = tex;
+  }).catch(() => setTimeout(() => t.imgLoading = false, 2000));   // still being written: retry
+  return null;
+}
+function bindTex(unit, tex, loc) { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniform1i(loc, unit); }
+
+// ---------- tiles, levels, workers ----------
+const q = await fetch(BASE + 'quilt.json').then(r => { if (!r.ok) throw Error('Run lab/quilt.py first'); return r.json(); })
+  .catch(e => { if (!EMBED && collection !== 'images') location.replace('?c=images'); throw e; });
+const credits = await fetch(BASE + 'credits.json').then(r => r.ok ? r.json() : []).catch(() => []);
+const creditOf = new Map(credits.map(c => [c.file, c]));
+const tiles = q.tiles.map(m => ({...m, compiling: !!m.pending, ready: false, levels: new Map(), pending: new Set()})), byName = new Map(tiles.map(t => [t.name, t]));
+const nWorkers = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 4) - 1));
+const workers = Array.from({length: nWorkers}, () => ({w: new Worker('quilt-worker.js?v=9'), inflight: 0, wanted: new Map()}));
+let levelId = 0, frameNo = 0;
+const lk = (e, j) => e + ':' + j;                                  // level key: energy + width level
+function wantLevel(t, j, prio, e = energyFor(t)) {
+  const key = lk(e, j); if (!t.ready || t.levels.has(key) || t.pending.has(key)) return;
+  const m = t.worker.wanted, id = t.name + '|' + key, o = m.get(id); if (!o || prio < o.prio) m.set(id, {t, j, e, key, prio});
+}
+function pump() {
+  for (const W of workers) {
+    const list = [...W.wanted.values()].sort((a, b) => a.prio - b.prio); W.wanted.clear();
+    for (const r of list) { if (W.inflight >= 2) break; r.t.pending.add(r.key); W.inflight++; W.w.postMessage({type: 'glevel', name: r.t.name, j: r.j, energy: r.e}); }
+  }
+}
+workers.forEach(W => W.w.onmessage = ({data}) => {
+  const t = byName.get(data.name);
+  if (data.type === 'loaded') { if (t) { t.ready = true; t.energies = data.energies || ['smart']; wantLevel(t, 0, -1, 'smart'); wantLevel(t, 0, 0, 'textbook'); } return; }
+  if (data.type === 'error') { console.error('quilt worker:', data.message); W.inflight = Math.max(0, W.inflight - 1); if (t) t.pending.clear(); return; }
+  if (data.type !== 'glevel' || !t) return;
+  const key = lk(data.energy, data.j); W.inflight--; t.pending.delete(key);
+  const L = {id: levelId++, j: data.j, e: data.energy, key, wj: data.wj, used: frameNo,
+    color: texture(data.wj, t.height, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(data.color.buffer)),
+    seam: texture(data.wj, t.max_remove_y, gl.R16UI, gl.RED_INTEGER, gl.UNSIGNED_SHORT, data.seams),
+    n: data.n || 0, marks: texture(Math.max(data.n || 0, 1), t.height, gl.RG16UI, gl.RG_INTEGER, gl.UNSIGNED_SHORT, data.marks)};
+  t.levels.set(key, L);
+  if (t.levels.size > 8) {                                     // LRU, level 0 of each energy pinned, never evict one used recently
+    let old = null; for (const v of t.levels.values()) if (v.j !== 0 && v.used < frameNo - 2 && (!old || v.used < old.used)) old = v;
+    if (old) { t.levels.delete(old.key); gl.deleteTexture(old.color); gl.deleteTexture(old.seam); gl.deleteTexture(old.marks); old.dead = true; }
+  }
+});
+
+// ---------- per-slot GPU state: two channels (width level j and j+1), each a position field + carved image ----------
+function channel(t) {
+  const W = t.width, H = t.height;
+  return {t, pos: [target(W, H, gl.R16UI, gl.RED_INTEGER, gl.UNSIGNED_SHORT), target(W, H, gl.R16UI, gl.RED_INTEGER, gl.UNSIGNED_SHORT)], cur: 0,
+    carve: target(W + 2, H + 2, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, true), tw: W + 2, th: H + 2, L: null, k: 0, key: '', region: [1, 1]};
+}
+const needsRebuild = (ch, L) => ch.posL !== L || L.dead;
+function updatePositions(ch, L, k0) {                            // P_{ch.k} -> P_{k0}: rebuild or O(|Δk|) update
+  const H = ch.t.height, rebuild = needsRebuild(ch, L);
+  const from = rebuild ? 0 : Math.min(ch.k, k0), to = rebuild ? k0 : Math.max(ch.k, k0);
+  if (!rebuild && from === to) return 0;
+  const src = ch.pos[ch.cur], dst = ch.pos[1 - ch.cur];
+  gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fb); gl.viewport(0, 0, L.wj, H); gl.useProgram(P.pos.p);
+  const u = P.pos.u; bindTex(0, src.tex, u.uPos); bindTex(1, L.seam, u.uSeam);
+  gl.uniform1i(u.uFrom, from); gl.uniform1i(u.uTo, to); gl.uniform1i(u.uSign, rebuild || k0 > ch.k ? 1 : -1); gl.uniform1i(u.uRebuild, rebuild ? 1 : 0);
+  gl.uniform4f(u.uRect, 0, 0, L.wj, H); gl.uniform2f(u.uRes, L.wj, H);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  ch.cur = 1 - ch.cur; ch.L = ch.posL = L; ch.k = k0; return 1;
+}
+
+// ---------- layout and motion ----------
+const sig = x => 1 / (1 + Math.exp(-x));
+function fit(us, mins, maxs, total) {
+  let lo = -40, hi = 40;
+  for (let it = 0; it < 36; it++) { const m = (lo + hi) / 2; let s = 0; for (let i = 0; i < us.length; i++) s += mins[i] + (maxs[i] - mins[i]) * sig(us[i] + m); if (s > total) hi = m; else lo = m; }
+  const m = (lo + hi) / 2; return us.map((u, i) => mins[i] + (maxs[i] - mins[i]) * sig(u + m));
+}
+const noise = (t, a) => .6 * Math.sin(t * a.f1 + a.p1) + .4 * Math.sin(t * a.f2 + a.p2);
+const wave = () => ({f1: .18 + Math.random() * .22, f2: .41 + Math.random() * .35, p1: Math.random() * 6.3, p2: Math.random() * 6.3});
+const springTo = (o, goal, dt, k = 45) => { const c = 2 * Math.sqrt(k); o.v += (k * (goal - o.u) - c * o.v) * dt; o.u += o.v * dt; };
+let rows = [], start = Math.floor(Math.random() * q.order.length), dpr = 1, quality = 1;   // quality in [0.5, 1]: adaptive resolution
+function layout() {
+  dpr = Math.min(devicePixelRatio || 1, 2) * quality; canvas.width = Math.round(innerWidth * dpr); canvas.height = Math.round(innerHeight * dpr);
+  const W = innerWidth, H = innerHeight, nRows = Math.max(2, Math.round(H / Math.min(340, Math.max(180, H / 3)))), rowH = H / nRows;
+  const old = rows; rows = []; let cursor = start; const order = (q.orders && q.orders[orderMode]) || q.order;
+  for (let r = 0; r < nRows; r++) {
+    const s = rowH / q.height / .8, slots = []; let nat = 0, min = 0;
+    while (nat < W * 1.5 || slots.length < 2) {
+      const t = tiles[order[cursor++ % order.length]], wmin = t.widths.at(-1) * s;
+      if (min + wmin > W * .9 && slots.length >= 2) { cursor--; break; }
+      const prev = old[r]?.slots[slots.length];
+      slots.push(prev && prev.t === t ? prev : {t, wave: wave(), u: 0, v: 0, wake: 0, ch: null}); nat += t.width * s; min += wmin;
+    }
+    rows.push(old[r] && old[r].slots.length === slots.length ? {...old[r], s, slots} : {s, slots, wave: wave(), u: 0, v: 0, wake: 0});
+  }
+  // Free GPU memory of slots that are gone (resize, reorder).
+  const live = new Set(rows.flatMap(r => r.slots));
+  for (const r of old) for (const sl of r.slots) if (!live.has(sl) && sl.ch) { for (const c of sl.ch) { for (const t of [...c.pos, c.carve]) { gl.deleteTexture(t.tex); gl.deleteFramebuffer(t.fb); } } sl.ch = null; }
+}
+let orderMode = EMBED?.order || 'style';                                           // 'style' (StyleCore tour) or 'edges' (Hungarian edge matching)
+const slotChannels = s => s.ch || (s.ch = [channel(s.t), channel(s.t)]);
+function nearestLevel(t, j, e) { let best = null; for (const L of t.levels.values()) if (L.e === e && (!best || Math.abs(L.j - j) < Math.abs(best.j - j))) best = L; return best; }
+let energy = 'smart';                                              // 'smart' (ours) or 'textbook' (vanilla seam carving)
+const energyFor = t => energy === 'textbook' && t.energies?.includes('textbook') ? 'textbook' : 'smart';
+
+// ---------- interaction ----------
+const mouse = {x: -1e4, y: -1e4, in: false, speed: 0, speedNorm: 0, lx: 0, ly: 0}, ripples = [];
+addEventListener('pointermove', e => { mouse.speed += Math.hypot(e.clientX - mouse.lx, e.clientY - mouse.ly); mouse.x = mouse.lx = e.clientX; mouse.y = mouse.ly = e.clientY; mouse.in = true; });
+document.addEventListener('pointerleave', () => mouse.in = false);
+canvas.addEventListener('pointerdown', e => { ripples.push({x: e.clientX, y: e.clientY, t: clock}); if (ripples.length > 6) ripples.shift(); });
+const gauss = (d, s) => Math.exp(-d * d / (2 * s * s));
+let mode = EMBED?.mode ?? 0;
+function drive(o, cx, cy, extent, dt, base) {                    // target growth in sigmoid units
+  const m = Math.min(innerWidth, innerHeight), d = mouse.in ? Math.hypot(cx - mouse.x, cy - mouse.y) : 1e9;
+  const hover = mouse.in && Math.abs(cx - mouse.x) < extent[0] / 2 && Math.abs(cy - mouse.y) < extent[1] / 2;
+  switch (mode) {
+    case 0: return base * 1.1 + (hover ? 2.6 : 0);
+    case 1: return base * .35 - 3.4 * gauss(d, .3 * m);
+    case 2: return base * .3 + 3.6 * gauss(d, .38 * m);
+    case 3: o.wake = Math.min(1.6, o.wake * Math.exp(-dt / 1.6) + mouse.speedNorm * gauss(d, .2 * m) * dt * 6); return base * .5 - 3 * o.wake;
+    case 4: { let r = base * .4;
+      for (const p of ripples) { const age = clock - p.t, dist = Math.hypot(cx - p.x, cy - p.y) / (.5 * m), front = dist - age * 1.1; r += 3 * Math.exp(-age / 3) * gauss(front, .35) * Math.sin(6 * front); }
+      return r; }
+  }
+  return base;
+}
+
+// ---------- frame ----------
+// Recordings (tools/recap) set window.QUILT_MANUAL and advance time themselves with window.__quiltStep(ms): exact, even steps.
+const MANUAL = !!window.QUILT_MANUAL, schedule = () => { if (!MANUAL) requestAnimationFrame(frame); };
+let paused = false, squash = false, gaps = true, last = MANUAL ? 0 : performance.now(), clock = 0, fps = 60, born = MANUAL ? 0 : performance.now();
+let maxRebuilds = 4, slowFrames = 0, fastFrames = 0, lastSig = NaN;   // full position rebuilds per frame (adaptive)
+function frame(now) {
+  frameNo++;
+  const dt = Math.min(.05, (now - last) / 1000); last = now; fps += (1 / Math.max(dt, 1e-3) - fps) * .05;
+  // Adaptive quality: slow frames lower resolution (visible updates are never deferred); fast frames restore it.
+  if (dt > .024) { slowFrames++; fastFrames = 0; } else if (dt < .018) { fastFrames++; slowFrames = 0; }
+  if (slowFrames > 20) { slowFrames = 0; maxRebuilds = Math.max(1, maxRebuilds - 1); if (quality > .5) { quality = Math.max(.5, quality - .15); layout(); } }
+  if (fastFrames > 120) { fastFrames = 0; maxRebuilds = Math.min(6, maxRebuilds + 1); if (quality < 1) { quality = Math.min(1, quality + .1); layout(); } }
+  if (!paused) clock += dt * (+$('motion').value / 50);
+  mouse.speedNorm = Math.min(3, mouse.speed / Math.max(dt, 1e-3) / 900); mouse.speed = 0;
+  const W = innerWidth, H = innerHeight, gap = gaps ? 6 : 0, radius = gaps ? 10 : 0, fade = Math.min(1, (now - born) / 900);
+  let yAcc = gap; const rowCenters = rows.map(r => { const h = r.h || H / rows.length, c = yAcc + h / 2; yAcc += h + gap; return c; });
+  const sdt = paused ? 0 : dt;                                      // pause freezes all motion, springs included
+  rows.forEach((r, i) => springTo(r, drive(r, mouse.x, rowCenters[i], [1e9, r.h || 0], sdt, .7 * noise(clock, r.wave)), sdt));
+  const hmin = rows.map(r => (q.height - Math.min(...r.slots.map(s => s.t.max_remove_y))) * r.s), hmax = rows.map(r => q.height * r.s);
+  const heights = fit(rows.map(r => r.u), hmin, hmax, H - gap * (rows.length + 1));
+  const jobs = [], draws = [];
+  let y = gap, carves = 0, rebuilds = 0;
+  rows.forEach((row, r) => {
+    row.h = heights[r];
+    row.slots.forEach(s => { const rc = s.rect || [0, y, W / row.slots.length, row.h]; springTo(s, drive(s, rc[0] + rc[2] / 2, y + row.h / 2, [rc[2], row.h], sdt, noise(clock, s.wave)), sdt); });
+    const total = W - gap * (row.slots.length + 1), maxs = row.slots.map(s => s.t.width * row.s), room = total / maxs.reduce((a, b) => a + b, 0);
+    if (room > 1) maxs.forEach((m, i) => maxs[i] = m * room);
+    const widths = fit(row.slots.map(s => s.u), row.slots.map(s => s.t.widths.at(-1) * row.s), maxs, total);
+    let x = gap;
+    const Y0 = y * dpr, hd = Math.max(1, row.h * dpr);
+    row.slots.forEach((s, i) => {
+      // Exact (fractional) geometry: the carve state follows the true size, so content evolves smoothly and
+      // monotonically; carve texels are fixed-scale and the draw pass places them at sub-pixel positions.
+      const t = s.t, w = widths[i], X0 = x * dpr, wd = Math.max(1, w * dpr); s.rect = [x, y, w, row.h]; x += w + gap;
+      const E = squash ? 'smart' : energyFor(t);
+      if (!t.levels.has(lk(E, 0)) && !t.levels.has(lk('smart', 0))) {   // seams not compiled / not decoded yet: squash the plain image
+        wantLevel(t, 0, -1, E); const img = imageTexture(t);
+        if (img) draws.push({img, rect: [X0, Y0, wd, hd], t, spin: t.compiling}); return;
+      }
+      if (t.img) { gl.deleteTexture(t.img); t.img = null; }
+      const H0 = t.height, Ky = t.max_remove_y, sc = row.s * dpr;
+      const ws = squash ? t.width : Math.max(t.widths.at(-1), Math.min(t.width, wd / sc)), tRem = squash ? 0 : Math.max(0, Math.min(Ky, H0 - hd / sc));
+      let j = 0; while (j + 1 < t.widths.length && t.widths[j + 1] >= ws) j++;
+      const p = j + 1 < t.widths.length ? (t.widths[j] - ws) / (t.widths[j] - t.widths[j + 1]) : 0, e = Math.min(1, Math.max(0, (p - .6) / .4));
+      const blend = squash ? 0 : e * e * (3 - 2 * e), j1 = Math.min(j + 1, t.widths.length - 1);
+      if (!squash) { wantLevel(t, j, 0, E); wantLevel(t, j1, 0, E); if (j1 + 1 < t.widths.length) wantLevel(t, j1 + 1, 1, E); if (j > 0) wantLevel(t, j - 1, 1, E); }
+      const La = squash ? t.levels.get(lk('smart', 0)) : (t.levels.get(lk(E, j)) || nearestLevel(t, j, E) || nearestLevel(t, j, 'smart'));
+      const Lb = !squash && p > .2 && j1 !== j ? t.levels.get(lk(E, j1)) || null : null;   // pre-built before the blend starts
+      La.used = frameNo; if (Lb) Lb.used = frameNo;
+      const ch = slotChannels(s);
+      if (ch[1].posL === La || (Lb && ch[0].posL === Lb)) ch.reverse();   // channels follow their level: no rebuild on level crossing
+      let k0 = Math.floor(tRem), f = tRem - k0; if (k0 >= Ky) { k0 = Ky; f = 0; }
+      const chH = Math.max(1, Math.min(hd, H0 - tRem)), outH = Math.min(Math.ceil(chH) + 1, H0 + 2);   // 1 texel = 1 screen px (or 1 source px when enlarged)
+      for (const [c, L, drawn] of Lb ? [[ch[0], La, true], [ch[1], Lb, blend > 0]] : [[ch[0], La, true]]) {
+        // Continuous width: remove kx of this level's width seams (fractional), then display-size output.
+        const kx = squash ? 0 : Math.max(0, Math.min(L.n, L.wj - ws)), wcont = L.wj - kx, cw = Math.max(1, Math.min(wd, wcont)), ow = Math.min(Math.ceil(cw) + 1, c.tw);
+        const key = `${L.id}:${k0}:${Math.round(f * 64)}:${Math.round(kx * 64)}:${Math.round(cw * 16)}:${Math.round(chH * 16)}`;   // re-carve on >= 1/16 px changes
+        if (c.key !== key) jobs.push({c, L, k0, f, outH, ow, cw, chH, kx, wcont, key, H0, Ky, drawn, rebuild: needsRebuild(c, L)});
+      }
+      draws.push({ch, Lb, rect: [X0, Y0, wd, hd], blend, t});
+    });
+    y += row.h + gap;
+  });
+  // Incremental updates always run (cheap); full rebuilds are rate-limited, visible ones first.
+  jobs.sort((a, b) => (a.rebuild - b.rebuild) || (b.drawn - a.drawn));
+  for (const jb of jobs) {
+    const {c, L, k0, f, outH, ow, cw, chH, kx, wcont, H0, Ky} = jb;
+    if (jb.rebuild) { if (rebuilds >= maxRebuilds) continue; rebuilds++; }
+    updatePositions(c, L, k0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, c.carve.fb); gl.viewport(0, 0, ow, outH); gl.useProgram(P.carve.p);
+    const u = P.carve.u; bindTex(0, c.pos[c.cur].tex, u.uPos); bindTex(1, L.seam, u.uSeam); bindTex(2, L.color, u.uColor); bindTex(3, L.marks, u.uMarks);
+    gl.uniform1i(u.uN, L.n); gl.uniform1f(u.uKx, kx);
+    gl.uniform1i(u.uH, H0); gl.uniform1i(u.uK0, k0); gl.uniform1i(u.uKy, Ky); gl.uniform1i(u.uTaps, quality < .8 ? 2 : 4);
+    gl.uniform1f(u.uF, f); gl.uniform1f(u.uScale, (H0 - (k0 + f)) / chH); gl.uniform1i(u.uWj, L.wj); gl.uniform1f(u.uXScale, wcont / cw);
+    gl.uniform4f(u.uRect, 0, 0, ow, outH); gl.uniform2f(u.uRes, ow, outH);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    c.key = jb.key; c.region = [cw, chH]; carves++;          // fractional region: the draw maps it exactly onto the rect
+  }
+  // Draw only if something visible changed: idle frames cost nothing.
+  for (const d of draws) if (!d.img) d.blend = d.Lb && d.ch[1].posL === d.Lb && d.ch[1].key ? d.blend : 0;   // blend only with a ready channel
+  let sig = carves * 7.3 + fade + (gaps ? 1 : 0) + dpr;
+  const qz = v => Math.round(v * 16);                                // 1/16 device px: settling springs don't force redraws
+  for (const d of draws) sig = (sig * 31 + qz(d.rect[0]) * 3 + qz(d.rect[1]) * 5 + qz(d.rect[2]) * 7 + qz(d.rect[3]) * 11 + Math.round(d.blend * 256) * 13 + (d.img ? 3 : d.ch[0].key ? 1 : 0)) % 1e9;
+  const spinning = draws.some(d => d.spin); if (spinning) sig = (sig + frameNo) % 1e9;   // spinners animate every frame
+  if (sig === lastSig) { pump(); schedule(); return; }
+  lastSig = sig;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.clearColor(BG[0], BG[1], BG[2], 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.useProgram(P.draw.p);
+  const u = P.draw.u;
+  for (const d of draws) {
+    if (d.img) {
+      bindTex(0, d.img, u.uA); bindTex(1, d.img, u.uB); gl.uniform4f(u.uUa, 1, 1, 0, 0); gl.uniform4f(u.uUb, 1, 1, 0, 0);
+      gl.uniform4f(u.uRect, d.rect[0], d.rect[1], d.rect[2], d.rect[3]); gl.uniform2f(u.uRes, canvas.width, canvas.height);
+      gl.uniform1f(u.uBlend, 0); gl.uniform1f(u.uAlpha, fade * (d.spin ? .72 : 1)); gl.uniform1f(u.uRadius, radius * dpr);
+      gl.drawArrays(gl.TRIANGLES, 0, 6); continue;
+    }
+    const [A, B] = d.ch; if (!A.key) continue;
+    const tw = A.tw, th = A.th, useB = d.blend > 0, ra = A.region, rb = (useB ? B : A).region;
+    bindTex(0, A.carve.tex, u.uA); bindTex(1, (useB ? B : A).carve.tex, u.uB);
+    gl.uniform4f(u.uUa, ra[0] / tw, ra[1] / th, 0, 0); gl.uniform4f(u.uUb, rb[0] / tw, rb[1] / th, 0, 0);   // rect <-> carve region, exactly (bilinear = sub-pixel)
+    gl.uniform4f(u.uRect, d.rect[0], d.rect[1], d.rect[2], d.rect[3]); gl.uniform2f(u.uRes, canvas.width, canvas.height);
+    gl.uniform1f(u.uBlend, d.blend); gl.uniform1f(u.uAlpha, fade); gl.uniform1f(u.uRadius, radius * dpr);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+  if (spinning) {
+    gl.useProgram(P.spin.p); const v = P.spin.u;
+    gl.uniform2f(v.uRes, canvas.width, canvas.height); gl.uniform1f(v.uTime, now / 1000); gl.uniform1f(v.uAlpha, fade);
+    for (const d of draws) if (d.spin) {
+      const [x, y, w, h] = d.rect, sz = Math.min(44 * dpr, w * .4, h * .4);
+      gl.uniform4f(v.uRect, x + (w - sz) / 2, y + (h - sz) / 2, sz, sz); gl.drawArrays(gl.TRIANGLES, 0, 6);
+    }
+  }
+  gl.disable(gl.BLEND);
+  pump();
+  const nComp = tiles.filter(t => t.compiling).length;
+  if (frameNo % 10 === 0) $('stats').textContent = `${nComp ? `compiling ${tiles.length - nComp}/${tiles.length} · ` : ''}WebGL2 · ${fps.toFixed(0)} fps · ${carves} carves · ${rebuilds} rebuilds · ${Math.round(quality * 100)}% res · ${energy === 'smart' ? 'ours' : 'vanilla'}`;
+  schedule();
+}
+
+// ---------- HUD ----------
+$('modes').innerHTML = MODES.map(([n, d], i) => `<button data-mode="${i}" title="${d}" aria-pressed="${i === mode}"><kbd>${i + 1}</kbd>${n}</button>`).join('');
+const setMode = i => { mode = i; ripples.length = 0; document.querySelectorAll('[data-mode]').forEach(b => b.setAttribute('aria-pressed', +b.dataset.mode === i)); };
+$('modes').addEventListener('click', e => { const b = e.target.closest('[data-mode]'); if (b) setMode(+b.dataset.mode); });
+const toggle = (id, fn) => { const b = $(id); b.addEventListener('click', () => { const on = b.getAttribute('aria-pressed') !== 'true'; b.setAttribute('aria-pressed', on); fn(on); }); };
+toggle('order', on => { orderMode = on ? 'edges' : 'style'; $('order').textContent = 'Order: ' + orderMode; layout(); });
+if (!q.orders) $('order').disabled = true;
+toggle('pause', on => paused = on); toggle('mode', on => squash = on); toggle('gaps', on => gaps = on); toggle('energy', on => energy = on ? 'textbook' : 'smart');
+addEventListener('keydown', e => {
+  if (EMBED) return;
+  const k = e.key.toLowerCase(), b = {' ': 'pause', s: 'mode', g: 'gaps', v: 'energy', o: 'order'}[k];
+  if (k === 'c') { const keys = Object.keys(COLLECTIONS); location.search = '?c=' + keys[(keys.indexOf(collection) + 1) % keys.length]; return; }
+  if (b) { e.preventDefault(); $(b).click(); } else if (k >= '1' && k <= String(MODES.length)) setMode(+k - 1); else if (k === 'h') $('hud').classList.toggle('hidden');
+});
+addEventListener('resize', layout);
+if (EMBED) { $('motion').value = EMBED.motion ?? 50; $('hud').hidden = true; }
+$('collection').innerHTML = Object.entries(COLLECTIONS).map(([k, [name]]) => `<option value="${k}"${k === collection ? ' selected' : ''}>${name}</option>`).join('');
+$('collection').addEventListener('change', e => location.search = '?c=' + e.target.value);
+// Caption: title / artist / date of the artwork under the cursor (from the collection's credits).
+let captioned = null;
+setInterval(() => {
+  let hit = null;
+  if (mouse.in) for (const r of rows) for (const sl of r.slots) { const [x, y, w, h] = sl.rect || []; if (sl.rect && mouse.x >= x && mouse.x < x + w && mouse.y >= y && mouse.y < y + h) hit = sl.t; }
+  const c = hit && creditOf.get(hit.source);
+  if (c !== captioned) { captioned = c; if (c) $('caption').innerHTML = `<b></b><span></span>`, $('caption').querySelector('b').textContent = c.title, $('caption').querySelector('span').textContent = [c.artist, c.date].filter(Boolean).join(' · ') + ' · CC0'; $('caption').classList.toggle('show', !!c); }
+}, 120);
+
+// ---------- start: visible tiles load first ----------
+layout();
+const seen = new Set(), prio = [];
+for (const r of rows) for (const s of r.slots) if (!seen.has(s.t.name)) { seen.add(s.t.name); prio.push(s.t); }
+for (const t of tiles) if (!seen.has(t.name)) prio.push(t);
+prio.forEach((t, i) => t.worker = workers[i % nWorkers]);
+const loadMsg = (W, metas) => metas.length && W.w.postMessage({type: 'load', base: BASE, energies: q.energies || ['smart'], tiles: metas});
+workers.forEach(W => loadMsg(W, prio.filter(t => t.worker === W && !t.compiling).map(t => q.tiles.find(m => m.name === t.name))));
+setTimeout(() => { if (tiles.some(t => !t.compiling) && !tiles.some(t => t.levels.size)) fallback('no carved tile after 10 s'); }, 10000);
+window.__quiltLoaded = () => { const v = rows.flatMap(r => r.slots.map(s => s.t)); return v.filter(t => t.levels.has('smart:0')).length / v.length; };   // for recordings (tools/recap)
+const vanillaButton = () => { const off = !(q.energies || []).includes('textbook'); $('energy').disabled = off; $('energy').title = off ? 'Vanilla seams not compiled yet: run lab/quilt.py --energy textbook' : 'V: vanilla seam carving (textbook forward energy) vs ours'; };
+vanillaButton();
+// Live compile: while lab/quilt.py is still running, poll quilt.json and swap tiles from squash to carving as their seams land.
+const done = () => !tiles.some(t => t.compiling) && (EMBED || (q.energies || []).includes('textbook') && q.orders);
+async function poll() {
+  if (done()) return;
+  try {
+    const nq = await fetch(BASE + 'quilt.json', {cache: 'no-store'}).then(r => r.json());
+    if (nq.tiles.length !== tiles.length) { location.reload(); return; }
+    nq.tiles.forEach((m, i) => {
+      const t = tiles[i]; if (t.name !== m.name) return;
+      const had = t.compiling ? [] : (t.energies || q.energies || ['smart']), now = m.pending ? [] : (m.energies || nq.energies || ['smart']);
+      if (now.length > had.length) {                               // newly compiled (or a new energy): (re)load in its worker
+        Object.assign(t, {widths: m.widths, max_remove_x: m.max_remove_x, max_remove_y: m.max_remove_y, compiling: false});
+        const i0 = q.tiles.findIndex(x => x.name === m.name); q.tiles[i0] = m;
+        t.worker.w.postMessage({type: 'load', base: BASE, energies: now, tiles: [m]});
+      }
+    });
+    const reorder = nq.orders && JSON.stringify(nq.orders) !== JSON.stringify(q.orders);
+    Object.assign(q, {energies: nq.energies, order: nq.order, orders: nq.orders}); vanillaButton(); $('order').disabled = !q.orders;
+    if (reorder) layout();                                         // style tour finished
+  } catch {}
+  setTimeout(poll, 2000);
+}
+setTimeout(poll, 2000);
+if (MANUAL) { let now = 0; window.__quiltStep = ms => frame(now += ms); } else requestAnimationFrame(frame);
+</script>
+</body>
+</html>
