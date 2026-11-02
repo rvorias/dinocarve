@@ -11,6 +11,6 @@
  "params": {
   "forward": "rubinstein"
  },
- "seconds": 2.32,
+ "seconds": 2.37,
  "device": "cuda:1"
 }

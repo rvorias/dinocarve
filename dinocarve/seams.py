@@ -120,15 +120,19 @@ def carve_order(pixels, steps, forward='relative', stress=0., spread=8, keep=Non
     batched = lambda t: t.to(device).expand(B, H, L) if t.dim() == 2 else t.to(device)
     seams = seam_solver(device)
     g = torch.Generator(device='cpu').manual_seed(seed)
-    jitter = (torch.rand(B, H, L, generator=g) * 1e-6).to(device)
+    jitter = (torch.rand(1, H, L, generator=g) * 1e-6).to(device).expand(B, H, L)   # same tie-breaks as carving each item alone
     orig = torch.arange(L, device=device).expand(B, H, L).contiguous()
     load = torch.zeros(B, H, L, device=device)
     rank = torch.full((B, H, L), NEVER, dtype=torch.int32, device=device)
-    scale = forward_costs(x, forward)[0].mean((1, 2), keepdim=True).clamp_min(1e-8)
     keep = batched(keep).float() if keep is not None and keep_weight else None
     rm = row_mask.to(device).float()[:, :, None] if row_mask is not None else None
-    if rm is not None:
+    cu0 = forward_costs(x, forward)[0]
+    if rm is not None:                                           # normalize by real rows only: padding must not reweight the terms
         jitter = jitter * rm
+        scale = (cu0 * rm).sum((1, 2), keepdim=True) / (rm.sum((1, 2), keepdim=True) * L).clamp_min(1)
+    else:
+        scale = cu0.mean((1, 2), keepdim=True)
+    scale = scale.clamp_min(1e-8)
     if parts is not None and budget:
         parts = batched(parts).long()
         P = int(parts.max()) + 1
@@ -144,7 +148,7 @@ def carve_order(pixels, steps, forward='relative', stress=0., spread=8, keep=Non
         if stress:
             extra = extra + stress * torch.nn.functional.avg_pool1d(load.reshape(B * H, 1, W), 2 * spread + 1, 1, spread, count_include_pad=False).reshape(B, H, W)
         if parts is not None:
-            share = (removed / size) / max(step / L, 1e-3) / H
+            share = (removed / size) / max(step / L, 1e-3)          # 1 when part c is carved at the image's average rate
             extra = extra + budget * share.gather(1, parts.reshape(B, -1)).view(B, H, W)
         if keep is not None:
             extra = extra + keep_weight * keep
