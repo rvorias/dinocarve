@@ -112,4 +112,4 @@ tests/                  CPU tests of the carving core and the quilt format
 - DINOv2 ([arXiv:2304.07193](https://arxiv.org/abs/2304.07193)) and registers ([arXiv:2309.16588](https://arxiv.org/abs/2309.16588)), loaded from `facebookresearch/dinov2` with torch.hub.
 - JAFAR ([arXiv:2506.11136](https://arxiv.org/abs/2506.11136)), code vendored from [PaulCouairon/JAFAR](https://github.com/PaulCouairon/JAFAR) under Apache-2.0. See `dinocarve/jafar/LICENSE`.
 
-MIT license for everything else.
+MIT license for the code. The images in `web/quilt/` are not covered by it: the CC0 artworks keep their museums' CC0 terms, and the author's own images are all rights reserved.

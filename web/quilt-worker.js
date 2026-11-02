@@ -73,11 +73,13 @@ async function load(meta, base) {
 }
 function seams(t, e) {
   return t.setP[e] ||= fetchBuffer(`${t.base}${t.meta.name}/seams${e === 'smart' ? '' : '-' + e}.bin.gz`, true).then(buf => {
-    const S = t.sets[e] = seamSet(t.meta, buf); if (t.sal) S.vMin = minByValue(S.v, t.sal); return S; });
+    const S = t.sets[e] = seamSet(t.meta, buf); if (t.sal) S.vMin = minByValue(S.v, t.sal); return S; })
+    .catch(err => { delete t.setP[e]; throw err; });             // a failed fetch is retried, not cached
 }
 function loadSaliency(t) {
   return t.salP ||= saliency(`${t.base}${t.meta.name}/saliency.png`, t.meta.width, t.meta.height).then(sal => {
-    t.sal = sal; for (const S of Object.values(t.sets)) S.vMin = minByValue(S.v, sal); });
+    t.sal = sal; for (const S of Object.values(t.sets)) S.vMin = minByValue(S.v, sal); })
+    .catch(err => { t.salP = null; throw err; });
 }
 const vMins = t => Object.fromEntries(Object.entries(t.sets).filter(([, S]) => S.vMin).map(([e, S]) => [e, S.vMin]));
 function hMinOf(t, L) {                                             // smallest height-seam rank per saliency value, for Protect
@@ -97,7 +99,12 @@ function computeLevel(t, j, energy) {
 }
 onmessage = async ({data}) => {
   try {
-    if (data.type === 'load') { for (const m of data.tiles) { await load(m, data.base); postMessage({type: 'loaded', name: m.name, energies: m.energies || ['smart']}); } }   // in priority order
+    if (data.type === 'load') {                  // in priority order; one broken tile does not stop the others
+      for (const m of data.tiles) {
+        try { await load(m, data.base); postMessage({type: 'loaded', name: m.name, energies: m.energies || ['smart']}); }
+        catch (e) { postMessage({type: 'loadfail', name: m.name, message: e.message}); }
+      }
+    }
     else if (data.type === 'saliency') {         // Protect turned on: fetch saliency, report width limits
       const t = tiles.get(data.name); await loadSaliency(t); postMessage({type: 'saliency', name: data.name, vMin: vMins(t)});
     }
@@ -123,5 +130,5 @@ onmessage = async ({data}) => {
       }
       postMessage({type: 'glevel', name: data.name, j, energy: data.energy, wj, n, color: L.color, seams: Y, marks, hMin, vMin: S.vMin}, [L.color.buffer, Y.buffer, marks.buffer]);
     }
-  } catch (e) { postMessage({type: 'error', message: e.message, name: data.name}); }
+  } catch (e) { postMessage({type: 'error', message: e.message, req: data.type, name: data.name, j: data.j, energy: data.energy}); }
 };

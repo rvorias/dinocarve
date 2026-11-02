@@ -19,6 +19,8 @@
  *   Properties (read-only): k, width (carved width in source pixels), naturalWidth (W),
  *   maxRemove (K). The last two are 0 until the src has loaded.
  *   Event: "carved" with detail {k, width, ms, backend} after each render. Also sets data-backend.
+ *   Event: "error" with detail Error when the src fails to load (also sets data-error); the next
+ *   resize or src change retries.
  *   Rendering is lazy: nothing is fetched or drawn until the element is within 200px of the
  *   viewport. Resizes and attribute changes coalesce into one render per animation frame.
  *
@@ -105,8 +107,12 @@ function gpu() {
     const draw = device.createRenderPipeline({
       layout: 'auto', vertex: {module, entryPoint: 'vs'}, fragment: {module, entryPoint: 'fs', targets: [{format}]},
     });
-    device.lost.then(() => { gpuPromise = undefined; });
-    return {device, format, compact, draw};
+    const g = {device, format, compact, draw, lost: false};
+    device.lost.then(() => {                     // fall back to the CPU for the rest of the page
+      g.lost = gpuBroken = true; gpuPromise = undefined;
+      dispatchEvent(new Event('carved-image-gpu-lost'));
+    });
+    return g;
   })().catch(() => null);
   return gpuPromise;
 }
@@ -121,7 +127,7 @@ function storage(device, data) {
 // One renderer per element; the asset's input buffers are shared by every element using it.
 function gpuRenderer(g, canvas, asset) {
   const {device} = g, {W, H} = asset;
-  asset.gpu ??= {color: storage(device, asset.color), rank: storage(device, asset.rank)};
+  if (asset.gpu?.device !== device) asset.gpu = {device, color: storage(device, asset.color), rank: storage(device, asset.rank)};
   const out = device.createBuffer({size: W * H * 4, usage: GPUBufferUsage.STORAGE});
   const params = device.createBuffer({size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST});
   const bind = (pipeline, buffers) => device.createBindGroup({
@@ -135,6 +141,7 @@ function gpuRenderer(g, canvas, asset) {
   return {
     backend: 'webgpu',
     async draw(k) {
+      if (g.lost) throw Error('WebGPU device lost');
       device.queue.writeBuffer(params, 0, new Uint32Array([W, H, k, W - k]));
       const encoder = device.createCommandEncoder();
       const cpass = encoder.beginComputePass();
@@ -188,6 +195,7 @@ class CarvedImage extends HTMLElement {
   #state = null; // {dir, asset, renderer, k} once the src has loaded
   #loading = null;
   #frame = 0;
+  #onGpuLost = () => { if (this.#state?.renderer.backend === 'webgpu') { this.#state.k = -1; this.schedule(); } };   // redraw: the draw throws and falls back
   visible = false;
 
   get k() { return this.#state?.k ?? 0; }
@@ -203,11 +211,13 @@ class CarvedImage extends HTMLElement {
     }
     nearViewport.observe(this);
     resized.observe(this);
+    addEventListener('carved-image-gpu-lost', this.#onGpuLost);
   }
 
   disconnectedCallback() {
     nearViewport.unobserve(this);
     resized.unobserve(this);
+    removeEventListener('carved-image-gpu-lost', this.#onGpuLost);
     cancelAnimationFrame(this.#frame);
     this.#frame = 0;
   }
@@ -247,8 +257,17 @@ class CarvedImage extends HTMLElement {
     if (this.#state?.dir !== dir) {
       if (this.#loading !== dir) {
         this.#loading = dir;
-        const [asset, g] = await Promise.all([loadAsset(dir), gpu()]);
+        let asset, g;
+        try {
+          [asset, g] = await Promise.all([loadAsset(dir), gpu()]);
+        } catch (err) {                          // the next schedule (resize, src change) retries
+          this.#loading = null;
+          this.dataset.error = err.message;
+          this.dispatchEvent(new CustomEvent('error', {detail: err}));
+          return;
+        }
         this.#loading = null;
+        delete this.dataset.error;
         if (dir !== this.#dir()) return this.schedule();
         const renderer = g ? gpuRenderer(g, this.#canvas, asset) : cpuRenderer(this.#canvas, asset);
         this.#state = {dir, asset, renderer, k: -1};

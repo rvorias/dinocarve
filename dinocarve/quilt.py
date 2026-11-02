@@ -159,9 +159,11 @@ def main():
     tiles, images, names = [], [], set()
     for path in paths:
         t0 = time.time()
-        name = base = ''.join(c if c.isalnum() else '-' for c in path.stem.lower()).strip('-')[:40]
+        name = base = ''.join(c if c.isalnum() else '-' for c in path.stem.lower()).strip('-')[:40] or 'tile'
+        n = 1
         while name in names:                                                       # truncated names can collide
-            name = f'{base}-{len(names)}'
+            n += 1
+            name = f'{base}-{n}'
         names.add(name)
         rgba = load(path, a.height)
         H, W = rgba.shape[:2]

@@ -4,3 +4,4 @@ __pycache__/
 .pytest_cache/
 library/
 report/
+tools/recap/

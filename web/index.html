@@ -82,8 +82,9 @@ document.documentElement.style.setProperty('--bg', `rgb(${BG.map(v => Math.round
 const BASE = new URL((params.get('q') || 'quilt').replace(/\/?$/, '/'), location.href).href;
 const MODES = [['Breathe', 'ambient waves, hover to swell'], ['Press', 'the cursor pushes into the quilt'], ['Fisheye', 'magnify around the cursor'], ['Plow', 'sweep to carve a wake'], ['Ripple', 'click to send carving waves']];
 // Error panel: replaces the page. detail is trusted HTML (constant strings); title and code are text.
+let stopped = false;                                                 // set by fail(): the page is gone, stop the frame loop and timers
 function fail(title, detail, code) {
-  console.warn('quilt:', title, code || '');
+  stopped = true; console.warn('quilt:', title, code || '');
   document.body.innerHTML = `<div id="error" role="alert"><b></b><p>${detail}</p><p><code class="why"></code></p><p><a href="https://github.com/rvorias/dinocarve">dinocarve on GitHub</a></p></div>`;
   document.querySelector('#error b').textContent = title; const c = document.querySelector('#error .why'); if (code) c.textContent = code; else c.parentElement.remove();
 }
@@ -190,7 +191,7 @@ function target(w, h, internal, fmt, type, linear) {
 }
 function imageTexture(t) {                                       // plain image, for tiles whose seams are not ready yet (squash)
   if (t.img || t.imgLoading) return t.img; t.imgLoading = true;
-  fetch(BASE + t.name + '/image.webp').then(r => r.blob()).then(b => createImageBitmap(b)).then(bm => {
+  fetch(BASE + t.name + '/image.webp').then(r => r.ok ? r.blob() : Promise.reject(Error(`HTTP ${r.status}`))).then(b => createImageBitmap(b)).then(bm => {
     const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, bm); gl.generateMipmap(gl.TEXTURE_2D); bm.close();
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
@@ -204,16 +205,17 @@ function bindTex(unit, tex, loc) { gl.activeTexture(gl.TEXTURE0 + unit); gl.bind
 // ---------- tiles, levels, workers ----------
 const q = await fetch(BASE + 'quilt.json').then(r => r.ok ? r.json() : Promise.reject(Error(`HTTP ${r.status}`))).catch(e => {
   fail('The quilt could not be loaded', 'Check your connection and reload. To run it yourself, compile one with <code>python -m dinocarve.quilt IMAGES web/quilt</code>.', `${BASE}quilt.json: ${e.message}`); throw e; });
+if (!q.tiles?.length) { fail('The quilt is empty', 'quilt.json lists no tiles.'); throw Error('empty quilt'); }
 showLoad(.1);
 const credits = await fetch(BASE + 'credits.json').then(r => r.ok ? r.json() : []).catch(() => []);
 const creditOf = new Map(credits.map(c => [c.file, c]));
-const tiles = q.tiles.map(m => ({...m, ready: false, levels: new Map(), pending: new Set()})), byName = new Map(tiles.map(t => [t.name, t]));
+const tiles = q.tiles.map(m => ({...m, ready: false, levels: new Map(), pending: new Set(), retry: new Map(), broken: false})), byName = new Map(tiles.map(t => [t.name, t]));
 const nWorkers = Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 4) - 1));
-const workers = Array.from({length: nWorkers}, () => ({w: new Worker('quilt-worker.js?v=11'), inflight: 0, wanted: new Map()}));
+const workers = Array.from({length: nWorkers}, () => ({w: new Worker('quilt-worker.js?v=12'), inflight: 0, wanted: new Map()}));
 let levelId = 0, frameNo = 0;
 const lk = (e, j) => e + ':' + j;                                  // level key: energy + width level
 function wantLevel(t, j, prio, e = energyFor(t)) {
-  const key = lk(e, j); if (!t.ready || t.levels.has(key) || t.pending.has(key)) return;
+  const key = lk(e, j); if (!t.ready || t.levels.has(key) || t.pending.has(key) || (t.retry.get(e)?.at > performance.now())) return;   // retry: per seam file (energy)
   const m = t.worker.wanted, id = t.name + '|' + key, o = m.get(id); if (!o || prio < o.prio) m.set(id, {t, j, e, key, prio});
 }
 function wantSaliency(t) { if (t.ready && !t.salReq) { t.salReq = true; t.worker.w.postMessage({type: 'saliency', name: t.name}); } }   // Protect only
@@ -228,9 +230,17 @@ workers.forEach(W => W.w.onmessage = ({data}) => {
   if (data.type === 'loaded') { if (t) { t.vMin = {}; t.ready = true; t.energies = data.energies; wantLevel(t, 0, -1, 'smart'); if (protect) wantSaliency(t); } return; }
   if (data.type === 'saliency') { if (t) { Object.assign(t.vMin, data.vMin); for (const L of t.levels.values()) if (!L.hMin) W.w.postMessage({type: 'hmin', name: t.name, j: L.j, energy: L.e}); relayoutSoon(); } return; }
   if (data.type === 'hmin') { const L = t?.levels.get(lk(data.energy, data.j)); if (L) L.hMin = data.hMin; return; }
-  if (data.type === 'error') { console.error('quilt worker:', data.message); W.inflight = Math.max(0, W.inflight - 1); if (t) t.pending.clear(); return; }
+  if (data.type === 'loadfail') { console.error('quilt worker:', data.name, data.message); if (t) { t.broken = true; layout(); } return; }
+  if (data.type === 'error') {
+    console.error('quilt worker:', data.req, data.name, data.message);
+    if (data.req === 'glevel') {                                    // back off: retry after 1 s, 2 s, 4 s ... up to 60 s
+      W.inflight = Math.max(0, W.inflight - 1);
+      if (t) { const n = (t.retry.get(data.energy)?.n || 0) + 1; t.pending.delete(lk(data.energy, data.j)); t.retry.set(data.energy, {n, at: performance.now() + Math.min(60, 2 ** (n - 1)) * 1000}); }
+    } else if (data.req === 'saliency' && t) t.salReq = false;      // the next Protect toggle asks again
+    return;
+  }
   if (data.type !== 'glevel' || !t) return;
-  const key = lk(data.energy, data.j); W.inflight--; t.pending.delete(key);
+  const key = lk(data.energy, data.j); W.inflight = Math.max(0, W.inflight - 1); t.pending.delete(key); t.retry.delete(data.energy);
   const L = {id: levelId++, j: data.j, e: data.energy, key, wj: data.wj, used: frameNo,
     color: texture(data.wj, t.height, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(data.color.buffer)),
     seam: texture(data.wj, t.max_remove_y, gl.R16UI, gl.RED_INTEGER, gl.UNSIGNED_SHORT, data.seams),
@@ -279,7 +289,8 @@ let rows = [], start = 0, dpr = 1, quality = 1;   // quality in [0.5, 1]: adapti
 function layout() {
   dpr = Math.min(devicePixelRatio || 1, 2) * quality; canvas.width = Math.round(innerWidth * dpr); canvas.height = Math.round(innerHeight * dpr);
   const W = innerWidth, H = innerHeight, nRows = Math.max(1, Math.round(H / (Math.min(340, Math.max(180, H / 3)) * scale))), rowH = H / nRows;
-  const next = () => tiles[order[cursor++ % order.length]];
+  const ok = tiles.some(t => !t.broken);                             // skip tiles that failed to load (unless all did)
+  const next = () => { for (let n = 0; n < order.length; n++) { const t = tiles[order[cursor++ % order.length]]; if (!ok || !t.broken) return t; } return tiles[order[0]]; };
   const old = rows; rows = []; let cursor = start;
   for (let r = 0; r < nRows; r++) {
     const s = rowH / q.height / .8, slots = []; let nat = 0, min = 0;
@@ -335,6 +346,7 @@ const MANUAL = !!window.QUILT_MANUAL, schedule = () => { if (!MANUAL) requestAni
 let paused = false, squash = false, gaps = true, last = MANUAL ? 0 : performance.now(), clock = 0, fps = 60, born = MANUAL ? 0 : performance.now();
 let maxRebuilds = 4, slowFrames = 0, fastFrames = 0, lastSig = NaN;   // full position rebuilds per frame (adaptive)
 function frame(now) {
+  if (stopped) return;
   frameNo++;
   if (loadShare < 1 && rows.length) showLoad(.1 + .9 * window.__quiltLoaded());
   const dt = Math.min(.05, (now - last) / 1000); last = now; fps += (1 / Math.max(dt, 1e-3) - fps) * .05;
@@ -465,6 +477,7 @@ if (!LAB) $('lab').hidden = true;
 // Caption: title / artist / date of the artwork under the cursor (from credits.json next to quilt.json).
 let captioned = null;
 setInterval(() => {
+  if (stopped) return;
   let hit = null;
   if (mouse.in) for (const r of rows) for (const sl of r.slots) { const [x, y, w, h] = sl.rect || []; if (sl.rect && mouse.x >= x && mouse.x < x + w && mouse.y >= y && mouse.y < y + h) hit = sl.t; }
   const c = hit && creditOf.get(hit.source);
@@ -481,7 +494,7 @@ const loadMsg = (W, metas) => metas.length && W.w.postMessage({type: 'load', bas
 workers.forEach(W => loadMsg(W, prio.filter(t => t.worker === W).map(t => q.tiles.find(m => m.name === t.name))));
 window.__quiltLimits = (name, T) => { const t = byName.get(name); return t && {v: limitOf(t.vMin?.smart, T), levels: Object.fromEntries([...t.levels.values()].filter(L => L.e === 'smart').map(L => [L.j, limitOf(L.hMin, T)]))}; };   // for tests
 window.__quiltVisible = () => rows.flatMap(r => r.slots.map(s => s.t.name));   // for tests
-window.__quiltLoaded = () => { const v = rows.flatMap(r => r.slots.map(s => s.t)); return v.filter(t => t.levels.has('smart:0')).length / v.length; };   // for recordings (tools/recap)
+window.__quiltLoaded = () => { const v = rows.flatMap(r => r.slots.map(s => s.t)).filter(t => !t.broken); return v.length ? v.filter(t => t.levels.has('smart:0')).length / v.length : 1; };   // for recordings (tools/recap)
 if (!(q.energies || []).includes('textbook')) $('energy').disabled = true;
 if (MANUAL) { let now = 0; window.__quiltStep = ms => frame(now += ms); } else requestAnimationFrame(frame);
 </script>
