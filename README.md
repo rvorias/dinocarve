@@ -2,6 +2,8 @@
 
 Content-aware image resizing that keeps the subject. Seam carving is guided by a frozen DINOv2 model, compiled once on the GPU, and resized in the browser with no model at runtime.
 
+**Live demo: [rvorias.github.io/dinocarve](https://rvorias.github.io/dinocarve/)**, a quilt of 24 images that resize continuously in your browser.
+
 ![The gnome resized to 40% width: classic seam carving cuts through the face, dinocarve keeps it](examples/gnome-compare.jpg)
 
 *The same image resized to 40% of its width. Regenerate with `python examples/make_figure.py`.*
