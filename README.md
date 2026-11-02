@@ -2,9 +2,9 @@
 
 Content-aware image resizing that keeps the subject. Seam carving is guided by a frozen DINOv2 model, compiled once on the GPU, and resized in the browser with no model at runtime.
 
-![The gnome at half width: textbook seam carving squeezes the face, dinocarve keeps it](examples/gnome-compare.jpg)
+![The gnome resized to 40% width: classic seam carving cuts through the face, dinocarve keeps it](examples/gnome-compare.jpg)
 
-*Left to right: the original, textbook seam carving at 50% width, dinocarve at 50% width, and the DINO saliency that guides it. Regenerate with `python examples/make_figure.py`.*
+*The same image resized to 40% of its width. Regenerate with `python examples/make_figure.py`.*
 
 ## Why
 
@@ -17,10 +17,12 @@ Both maps come from DINOv2-S/14 with registers. JAFAR lifts them from the 14px t
 
 ## Quickstart
 
+With [uv](https://docs.astral.sh/uv/):
+
 ```bash
-pip install -e .                          # torch, numpy, pillow, einops
-python -m dinocarve photo.jpg out/photo   # first run downloads DINOv2 (~90 MB) and JAFAR (~7 MB)
-python -m http.server 8000                # then open http://localhost:8000/web/index.html
+uv sync                                          # creates .venv from uv.lock: torch, numpy, pillow, einops
+uv run python -m dinocarve photo.jpg out/photo   # first run downloads DINOv2 (~90 MB) and JAFAR (~7 MB)
+python3 -m http.server 8000                      # then open http://localhost:8000/web/ for the living quilt
 ```
 
 The compiler writes `out/photo/{image.jpg, rank.png, carve.json, saliency.png}`. Show it in any page:
@@ -56,6 +58,22 @@ Performance details:
 - **Caching.** Each `src` is fetched and decoded one time per page, however many elements show it.
 - **Lazy loading.** An element loads and draws nothing until it is within 200px of the viewport.
 
+## Living quilt
+
+`web/index.html` is the demo: a full-window quilt of images that resize continuously in width and height. Each tile carves to its own box every frame, in WebGL2, from compiled seams. `web/quilt/` holds 24 images: 10 public-domain artworks (CC0, Art Institute of Chicago and Cleveland Museum of Art) and 14 of the author's own images. Compile your own folder with:
+
+```bash
+uv run python -m dinocarve.quilt IMAGES web/quilt [--height 540] [--device cuda:1]
+```
+
+Each image gets one vertical seam order, plus a horizontal seam order for each of 33 widths. All 33 compile in one batch. Both dino and textbook seams are compiled. The compiler also orders the tiles so that each image's right edge continues into the next image's left edge (`order` in `quilt.json`); the page shuffles the tiles on every load instead. A `credits.json` next to the images (`[{file, title, artist, date}]`) is shown on hover.
+
+The controls are on screen. Press H to hide them, or pass `?controls=0` for an iframe. **Vanilla** switches to textbook seams, and **Squash** to plain resizing. One experiment is included:
+
+- **Protect.** Tiles never shrink past the first seam that would remove a pixel with saliency at or above the threshold.
+
+You can also scale the tiles. The Experimental panel (scale, Protect) shows on localhost only; `?lab=1` shows it elsewhere and `?lab=0` hides it. Query options: `?q=` (quilt folder), `?bg=`, `?lab=`, `?motion=`, `?protect=0.5`, `?scale=`.
+
 ## Output format
 
 | File | Content |
@@ -77,12 +95,15 @@ Performance details:
 dinocarve/seams.py      energy, seam DP, nested rank map, k-means, PCA, PNG encoding
 dinocarve/dino.py       DINOv2-S/14-reg saliency and part features, JAFAR upsampling, model download
 dinocarve/kernel.py     fused Triton seam kernel (used on CUDA, with a PyTorch fallback)
-dinocarve/__main__.py   the compile command
+dinocarve/__main__.py   the compile command (one image, width only)
+dinocarve/quilt.py      the quilt compiler (many images, width and height)
 dinocarve/jafar/        JAFAR model code, vendored (Apache-2.0)
 web/dinocarve.js        <carved-image> and <carved-gallery>
-web/index.html          demo: textbook vs dinocarve slider, and a gallery
+web/index.html          the living quilt (WebGL2)
+web/quilt-worker.js     decodes quilt seams off the main thread
+web/quilt/              the compiled example quilt
 examples/               the compiled gnome (dino and textbook) and the README figure script
-tests/test_seams.py     CPU tests of the carving core
+tests/                  CPU tests of the carving core and the quilt format
 ```
 
 ## Credits

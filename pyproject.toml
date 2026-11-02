@@ -5,7 +5,7 @@ description = "Seam carving guided by DINOv2 saliency, compiled once and resized
 requires-python = ">=3.10"
 dependencies = ["torch>=2.2", "numpy", "pillow", "einops"]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = ["pytest"]
 
 [build-system]

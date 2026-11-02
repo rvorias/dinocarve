@@ -102,32 +102,38 @@ def cluster(features, k=12, iters=25, seed=0):
 
 
 def carve_order(pixels, steps, forward='relative', stress=0., spread=8, keep=None, keep_weight=0., parts=None, budget=0.,
-                device=None, seed=0, return_paths=False):
-    """Nested removal ranks [H,W] uint16 for the first `steps` vertical seams.
+                device=None, seed=0, return_paths=False, row_mask=None):
+    """Nested removal ranks for the first `steps` vertical seams: [H,W] uint16, or [B,H,W] for a batch.
 
-    pixels: [1,H,W,C] features the join cost is measured in (see pixel_features).
-    keep: [H,W] importance in [0,1]; removing a pixel costs keep_weight * keep.
-    parts: [H,W] integer labels; removing a pixel of part c costs
+    pixels: [B,H,W,C] features the join cost is measured in (see pixel_features). B > 1 carves B
+        images of the same padded size in one pass, each with its own seams and statistics.
+    keep: [H,W] or [B,H,W] importance in [0,1]; removing a pixel costs keep_weight * keep.
+    parts: [H,W] or [B,H,W] integer labels; removing a pixel of part c costs
         budget * (fraction of c removed) / (fraction of the image removed), so no part is carved away whole.
-    return_paths: also return the seams [steps,H] in the coordinates of the image at that step."""
+    row_mask: [B,H] 0/1; masked rows cost nothing (padding when the batch has images of different heights).
+    return_paths: also return the seams, [steps,H] (or [steps,B,H]), in the coordinates of the image at that step."""
     device = device or pixels.device
     x = pixels.to(device)
-    _, H, L, _ = x.shape
+    B, H, L, _ = x.shape
     if steps > L - 2:
         raise ValueError('steps must leave at least 2 columns')
+    batched = lambda t: t.to(device).expand(B, H, L) if t.dim() == 2 else t.to(device)
     seams = seam_solver(device)
     g = torch.Generator(device='cpu').manual_seed(seed)
-    jitter = (torch.rand(1, H, L, generator=g) * 1e-6).to(device)
-    orig = torch.arange(L, device=device).expand(1, H, L).contiguous()
-    load = torch.zeros(1, H, L, device=device)
-    rank = torch.full((1, H, L), NEVER, dtype=torch.int32, device=device)
-    scale = forward_costs(x, forward)[0].mean().clamp_min(1e-8)
-    keep = keep.to(device).float()[None] if keep is not None and keep_weight else None
+    jitter = (torch.rand(B, H, L, generator=g) * 1e-6).to(device)
+    orig = torch.arange(L, device=device).expand(B, H, L).contiguous()
+    load = torch.zeros(B, H, L, device=device)
+    rank = torch.full((B, H, L), NEVER, dtype=torch.int32, device=device)
+    scale = forward_costs(x, forward)[0].mean((1, 2), keepdim=True).clamp_min(1e-8)
+    keep = batched(keep).float() if keep is not None and keep_weight else None
+    rm = row_mask.to(device).float()[:, :, None] if row_mask is not None else None
+    if rm is not None:
+        jitter = jitter * rm
     if parts is not None and budget:
-        parts = parts.to(device).long()[None]
+        parts = batched(parts).long()
         P = int(parts.max()) + 1
-        size = torch.bincount(parts.flatten(), minlength=P).float().clamp_min(1)
-        removed = torch.zeros(P, device=device)
+        size = torch.zeros(B, P, device=device).scatter_add_(1, parts.reshape(B, -1), torch.ones(B, H * L, device=device)).clamp_min(1)
+        removed = torch.zeros(B, P, device=device)
     else:
         parts = None
     paths = []
@@ -136,31 +142,37 @@ def carve_order(pixels, steps, forward='relative', stress=0., spread=8, keep=Non
         W = orig.shape[2]
         extra = 0.
         if stress:
-            extra = extra + stress * torch.nn.functional.avg_pool1d(load.reshape(H, 1, W), 2 * spread + 1, 1, spread, count_include_pad=False).reshape(1, H, W)
+            extra = extra + stress * torch.nn.functional.avg_pool1d(load.reshape(B * H, 1, W), 2 * spread + 1, 1, spread, count_include_pad=False).reshape(B, H, W)
         if parts is not None:
             share = (removed / size) / max(step / L, 1e-3) / H
-            extra = extra + budget * share[parts]
+            extra = extra + budget * share.gather(1, parts.reshape(B, -1)).view(B, H, W)
         if keep is not None:
             extra = extra + keep_weight * keep
-        p = seams(cu + extra, cl + extra, cr + extra, jitter[:, :, :W])[..., None]
+        cu, cl, cr = cu + extra, cl + extra, cr + extra
+        if rm is not None:
+            cu, cl, cr = cu * rm, cl * rm, cr * rm
+        p = seams(cu, cl, cr, jitter[:, :, :W])[..., None]
         if return_paths:
-            paths.append(p[0, :, 0].cpu())
+            paths.append(p[..., 0].cpu())
         rank.scatter_(2, orig.gather(2, p), step)
         if stress:
             share_load = (load.gather(2, p) + 1) / 2
             load.scatter_add_(2, (p - 1).clamp(0, W - 1), share_load)
             load.scatter_add_(2, (p + 1).clamp(0, W - 1), share_load)
         if parts is not None:
-            removed.scatter_add_(0, parts.gather(2, p).flatten(), torch.ones(H, device=device))
+            removed.scatter_add_(1, parts.gather(2, p)[..., 0], torch.ones(B, H, device=device))
         mask = torch.ones_like(orig, dtype=torch.bool)
         mask.scatter_(2, p, False)
-        orig, load, x = orig[mask].view(1, H, W - 1), load[mask].view(1, H, W - 1), x[mask].view(1, H, W - 1, x.shape[-1])
+        orig, load, x = orig[mask].view(B, H, W - 1), load[mask].view(B, H, W - 1), x[mask].view(B, H, W - 1, x.shape[-1])
         if parts is not None:
-            parts = parts[mask].view(1, H, W - 1)
+            parts = parts[mask].view(B, H, W - 1)
         if keep is not None:
-            keep = keep[mask].view(1, H, W - 1)
-    rank = rank[0].cpu().numpy().astype(np.uint16)
-    return (rank, torch.stack(paths).numpy()) if return_paths else rank
+            keep = keep[mask].view(B, H, W - 1)
+    rank = rank.cpu().numpy().astype(np.uint16)
+    paths = torch.stack(paths).numpy() if return_paths else None
+    if B == 1:
+        rank, paths = rank[0], (paths[:, 0] if return_paths else None)
+    return (rank, paths) if return_paths else rank
 
 
 def encode(rank):
