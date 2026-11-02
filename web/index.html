@@ -8,7 +8,7 @@
   :root { --bg:#0a0d0c; --ink:#e7eee9; --muted:#9fb3a7; --accent:#c7df92; --panel:rgba(14,19,17,.78); }
   * { box-sizing:border-box; }
   html,body { margin:0; height:100%; background:var(--bg); color:var(--ink); font:13px/1.45 system-ui,sans-serif; overflow:hidden; }
-  canvas { position:fixed; inset:0; width:100vw; height:100vh; display:block; }
+  canvas { position:fixed; inset:0; width:100%; height:100%; display:block; touch-action:none; }   /* 100%, not 100vh: matches innerHeight under mobile toolbars */
   .hud { position:fixed; left:18px; bottom:18px; display:flex; flex-wrap:wrap; gap:8px 14px; align-items:center; padding:10px 14px; background:var(--panel); border:1px solid rgba(199,223,146,.14); border-radius:12px; backdrop-filter:blur(10px); max-width:calc(100vw - 36px); transition:opacity .4s; }
   .hud b { font:normal 17px Georgia,serif; margin-right:2px; }
   .hud button { background:rgba(255,255,255,.04); color:var(--ink); border:1px solid rgba(255,255,255,.1); border-radius:7px; padding:4px 9px; font:inherit; cursor:pointer; }
@@ -27,6 +27,7 @@
   #caption.show { opacity:1; }
   .hud.lab { top:18px; bottom:auto; max-width:min(560px, calc(100vw - 36px)); border-style:dashed; }
   .hud output { font-variant-numeric:tabular-nums; min-width:2.5em; }
+  @media (hover: none), (max-width: 640px) { #hud, #lab { display:none; } }   /* phones and tablets: just the quilt */
   #loader { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%); width:min(260px, calc(100vw - 32px)); text-align:center; color:var(--muted); font-size:12px; transition:opacity .5s; pointer-events:none; }
   #loader .bar { height:3px; margin-top:8px; border-radius:2px; background:rgba(199,223,146,.15); overflow:hidden; }
   #loader .bar i { display:block; height:100%; width:0; background:var(--accent); transition:width .3s; }
@@ -288,7 +289,7 @@ const order = q.order.slice(); for (let i = order.length - 1; i > 0; i--) { cons
 let rows = [], start = 0, dpr = 1, quality = 1;   // quality in [0.5, 1]: adaptive resolution
 function layout() {
   dpr = Math.min(devicePixelRatio || 1, 2) * quality; canvas.width = Math.round(innerWidth * dpr); canvas.height = Math.round(innerHeight * dpr);
-  const W = innerWidth, H = innerHeight, nRows = Math.max(1, Math.round(H / (Math.min(340, Math.max(180, H / 3)) * scale))), rowH = H / nRows;
+  const W = innerWidth, H = innerHeight, nRows = Math.max(1, Math.round(H / (Math.min(340, Math.max(130, Math.min(H / 3, W * .42))) * scale))), rowH = H / nRows;   // narrow screens: shorter rows, more tiles
   const ok = tiles.some(t => !t.broken);                             // skip tiles that failed to load (unless all did)
   const next = () => { for (let n = 0; n < order.length; n++) { const t = tiles[order[cursor++ % order.length]]; if (!ok || !t.broken) return t; } return tiles[order[0]]; };
   const old = rows; rows = []; let cursor = start;
@@ -322,7 +323,9 @@ const energyFor = t => energy === 'textbook' && t.energies?.includes('textbook')
 const mouse = {x: -1e4, y: -1e4, in: false, speed: 0, speedNorm: 0, lx: 0, ly: 0}, ripples = [];
 addEventListener('pointermove', e => { mouse.speed += Math.hypot(e.clientX - mouse.lx, e.clientY - mouse.ly); mouse.x = mouse.lx = e.clientX; mouse.y = mouse.ly = e.clientY; mouse.in = true; });
 document.addEventListener('pointerleave', () => mouse.in = false);
-canvas.addEventListener('pointerdown', e => { ripples.push({x: e.clientX, y: e.clientY, t: clock}); if (ripples.length > 6) ripples.shift(); });
+canvas.addEventListener('pointerdown', e => {
+  if (e.pointerType !== 'mouse') { mouse.x = mouse.lx = e.clientX; mouse.y = mouse.ly = e.clientY; mouse.in = true; }   // a tap opens the tile under it
+  ripples.push({x: e.clientX, y: e.clientY, t: clock}); if (ripples.length > 6) ripples.shift(); });
 const gauss = (d, s) => Math.exp(-d * d / (2 * s * s));
 let mode = 0;
 function drive(o, cx, cy, extent, dt, base) {                    // target growth in sigmoid units
